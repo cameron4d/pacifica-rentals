@@ -6,7 +6,6 @@ const crypto = require('crypto');
 const path = require('path');
 const https = require('https');
 const fs = require('fs');
-const AnthropicBedrock = require('@anthropic-ai/bedrock-sdk');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -19,11 +18,9 @@ const TABLEAU_SERVER = process.env.TABLEAU_SERVER;
 const TABLEAU_SITE   = process.env.TABLEAU_SITE;
 const TABLEAU_API    = process.env.TABLEAU_API;
 
-const anthropic = new AnthropicBedrock({ awsRegion: 'us-west-2' });
-
 // ── Watched-metric allowlist ─────────────────────────────────────────────────
-// Only metrics whose UUID appears here will be passed to Claude.
-// Leave the array EMPTY to allow all metrics.
+// Pulse metric UUIDs the COO dashboard cares about. The frontend reads this
+// via /watched-metrics to scope the brief request.
 const WATCHED_METRICS = [
   '27a7b6ba-c91d-4154-93a2-e127f7508b19',
   '989699c4-4050-4f71-9b1e-1ba7873707e1',
@@ -40,52 +37,6 @@ const WATCHED_METRICS = [
   '0d185291-73f7-431a-816b-e7c3f6649341',
   '07ee59a8-3783-4ecd-b589-e4abfc29289e'
 ];
-
-// ── System prompt ────────────────────────────────────────────────────────────
-const COO_SYSTEM_PROMPT = `
-You are a business intelligence assistant for a COO at Hertz.
-You have access to live Tableau Pulse MCP tools. Always call them to retrieve real metric data before writing your response.
-
-CRITICAL — METRIC ALLOWLIST:
-You must ONLY reference metrics whose UUID appears in the following approved list.
-If any tool returns metrics with IDs not in this list, ignore them completely — do not mention them, do not use their data.
-Approved metric IDs (these are the ONLY metrics you are permitted to use):
-${WATCHED_METRICS.map(id => `  ${id}`).join('\n')}
-
-YOUR OUTPUT MUST CONTAIN EXACTLY THREE THINGS — IN THIS ORDER — AND NOTHING ELSE:
-
-  1. <h3>Key Observations</h3>
-  2. A <ul> containing exactly 3 to 5 <li> items. Each <li> must:
-       - Open with <strong>[Metric Name]:</strong>
-       - State the specific problem or risk in one sentence, including the actual number and how far it deviates from target or prior period.
-       - Follow with one to two sentences identifying the root cause or underlying driver.
-  3. <hr><p><em>Data sourced from Tableau Pulse — [today's date].</em></p>
-  4. A metric block for each of the 2 most important metrics, using EXACTLY this markup
-     (copy the real UUID from the MCP tool results into data-metric-id — never invent one):
-
-  <div class="metric-block" data-metric-id="EXACT-UUID-FROM-TOOL">
-    <div class="metric-name">Metric display name</div>
-    <div class="metric-stats">
-      <span class="metric-value">Value: [actual number with units]</span>
-      <span class="metric-change positive">[+X.X%]</span>
-      <span class="metric-trend">↑</span>
-    </div>
-    <div class="metric-drivers">Drivers: one or two sentences explaining the key drivers.</div>
-  </div>
-
-ABSOLUTE RULES — violation of any of these is an error:
-- Do NOT output any text, element, or whitespace before <h3>Key Observations</h3>.
-- Do NOT output any headings, paragraphs, narrative, tables, or metric blocks of any kind.
-- Do NOT include an introduction, executive summary, dashboard title, or overall performance statement.
-- Do NOT include a table or any <table>, <thead>, <tbody>, <tr>, <th>, or <td> tags.
-- Do NOT include any <span> elements.
-- <div> is permitted ONLY for metric-ID tagging as described below.
-- Do NOT include <html>, <head>, <body>, or <script> tags.
-- Do NOT wrap output in markdown code fences.
-- Do NOT use markdown syntax of any kind.
-- The ONLY tags allowed in your response are: <h3> <ul> <li> <strong> <em> <hr> <p> <div>
-- Focus exclusively on metrics that show a problem, risk, or need for action. Ignore positive or stable metrics.
-`.trim();
 
 // ── JWT builder ──────────────────────────────────────────────────────────────
 function generateJWT() {
@@ -149,82 +100,61 @@ async function getTableauSession() {
   return tableauSession;
 }
 
-// ── Persistent MCP client ────────────────────────────────────────────────────
-let mcpClient     = null;
-let mcpConnecting = false;
-
-async function getMCPClient() {
-  if (mcpClient) return mcpClient;
-  if (mcpConnecting) {
-    await new Promise(r => setTimeout(r, 1000));
-    return getMCPClient();
-  }
-  mcpConnecting = true;
-  try {
-    const { Client }             = await import('@modelcontextprotocol/sdk/client/index.js');
-    const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
-    const transport = new SSEClientTransport(new URL('http://localhost:3100/sse'));
-    const client    = new Client({ name: 'hertz-portal', version: '1.0.0' }, { capabilities: {} });
-    await client.connect(transport);
-    mcpClient = client;
-    console.log('MCP client connected');
-    return client;
-  } finally {
-    mcpConnecting = false;
-  }
+// ── VizQL Data Service helpers (direct Tableau REST) ─────────────────────────
+async function vizqlReadMetadata(datasourceLuid) {
+  const session = await getTableauSession();
+  const url     = `${TABLEAU_SERVER}/api/v1/vizql-data-service/read-metadata`;
+  const r = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'X-Tableau-Auth': session.token,
+      'Content-Type':  'application/json',
+      Accept:          'application/json'
+    },
+    body: JSON.stringify({ datasource: { datasourceLuid } })
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`vizql read-metadata HTTP ${r.status}: ${text.substring(0, 300)}`);
+  return JSON.parse(text);
 }
 
-async function callMCPTool(toolName, toolArgs = {}) {
-  const client = await getMCPClient();
-  console.log(`→ MCP: ${toolName}`, JSON.stringify(toolArgs));
-  try {
-    const result = await client.callTool({ name: toolName, arguments: toolArgs });
-    return result.content;
-  } catch (err) {
-    console.log('MCP error — resetting client:', err.message);
-    mcpClient = null;
-    throw err;
-  }
+async function vizqlQueryDatasource(datasourceLuid, query) {
+  const session = await getTableauSession();
+  const url     = `${TABLEAU_SERVER}/api/v1/vizql-data-service/query-datasource`;
+  const r = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'X-Tableau-Auth': session.token,
+      'Content-Type':  'application/json',
+      Accept:          'application/json'
+    },
+    body: JSON.stringify({ datasource: { datasourceLuid }, query })
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`vizql query-datasource HTTP ${r.status}: ${text.substring(0, 300)}`);
+  const parsed = JSON.parse(text);
+  return parsed.data ?? parsed.rows ?? parsed.results ?? [];
 }
 
-async function getMCPTools() {
-  const client = await getMCPClient();
-  return (await client.listTools()).tools;
+// ── Pulse insight bundle (direct Tableau REST) ───────────────────────────────
+async function pulseInsightBundle(bundleRequest, bundleType = 'detail') {
+  const session = await getTableauSession();
+  const url     = `${TABLEAU_SERVER}/api/-/pulse/insights/${bundleType}`;
+  const r = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'X-Tableau-Auth': session.token,
+      'Content-Type':  'application/json',
+      Accept:          'application/json'
+    },
+    body: JSON.stringify(bundleRequest)
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`pulse insights/${bundleType} HTTP ${r.status}: ${text.substring(0, 300)}`);
+  return JSON.parse(text);
 }
 
-// ── Fetch Pulse metrics via MCP (preferred path) ─────────────────────────────
-async function getPulseMetricsViaMCP() {
-  const tools     = await getMCPTools();
-  const toolNames = tools.map(t => t.name);
-  console.log('Available MCP tools:', toolNames.join(', '));
-
-  const candidates = [
-    'list_metrics',
-    'get_pulse_metrics',
-    'list_pulse_metrics',
-    'get_metrics',
-    'pulse_list_metrics',
-    'tableau_pulse_list_metrics',
-    'list_subscribed_metrics',
-    'get_subscriptions'
-  ];
-
-  for (const name of candidates) {
-    if (!toolNames.includes(name)) continue;
-    console.log(`Trying MCP tool: ${name}`);
-    try {
-      const result = await callMCPTool(name, {});
-      const text   = result.map(c => c.text || JSON.stringify(c)).join('\n');
-      console.log(`✔ MCP tool ${name} returned ${text.length} chars`);
-      return { source: `MCP:${name}`, data: text };
-    } catch (e) {
-      console.warn(`MCP tool ${name} failed:`, e.message);
-    }
-  }
-  return null;
-}
-
-// ── Fetch Pulse metrics via direct Tableau REST (fallback) ───────────────────
+// ── Fetch Pulse metrics via direct Tableau REST ──────────────────────────────
 async function getPulseMetricsDirect(session) {
   const headers = {
     'X-Tableau-Auth': session.token,
@@ -319,111 +249,6 @@ function markdownToHtml(text) {
     .replace(/(<\/h[23]>)<\/p>/g,  '$1');
 }
 
-// ── Parse metrics from Claude's HTML response ─────────────────────────────────
-function parseMetricsFromHTML(html) {
-  const metrics = [];
-
-  const nameRegex    = /<div class="metric-name">([\s\S]*?)<\/div>/i;
-  const valueRegex   = /<span class="metric-value">([\s\S]*?)<\/span>/i;
-  const changeRegex  = /<span class="metric-change[^"]*">([\s\S]*?)<\/span>/i;
-  const trendRegex   = /<span class="metric-trend">([\s\S]*?)<\/span>/i;
-  const driversRegex = /<div class="metric-drivers">([\s\S]*?)<\/div>/i;
-
-  const blockOpenings = [
-    ...html.matchAll(/<div class="metric-block"[^>]*data-metric-id="([0-9a-f-]{36})"[^>]*>/gi)
-  ];
-
-  for (const blockMatch of blockOpenings) {
-    const id    = blockMatch[1];
-    const slice = html.slice(blockMatch.index, blockMatch.index + 1200);
-
-    metrics.push({
-      id,
-      name:    nameRegex.exec(slice)?.[1]?.trim()    ?? null,
-      value:   valueRegex.exec(slice)?.[1]?.trim()   ?? null,
-      change:  changeRegex.exec(slice)?.[1]?.trim()  ?? null,
-      trend:   trendRegex.exec(slice)?.[1]?.trim()   ?? null,
-      drivers: driversRegex.exec(slice)?.[1]?.trim() ?? null,
-    });
-  }
-
-  return metrics;
-}
-
-// ── Log identified metrics ────────────────────────────────────────────────────
-function logIdentifiedMetrics(metrics) {
-  console.log('\n╔══════════════════════════════════════════════╗');
-  console.log('║         IDENTIFIED PULSE METRICS             ║');
-  console.log('╚══════════════════════════════════════════════╝');
-
-  if (!metrics.length) {
-    console.log('  ⚠  No metrics parsed — Claude may not have included data-metric-id attributes.');
-    return;
-  }
-
-  metrics.forEach((m, i) => {
-    const idStatus = m.id ? `✔ ${m.id}` : '✘ MISSING — embed will fail';
-    console.log(`\n  [${i + 1}] ${m.name}`);
-    console.log(`       Value   : ${m.value   ?? '—'}`);
-    console.log(`       Change  : ${m.change  ?? '—'}`);
-    console.log(`       Trend   : ${m.trend   ?? '—'}`);
-    console.log(`       Drivers : ${m.drivers ?? '—'}`);
-    console.log(`       ID      : ${idStatus}`);
-  });
-
-  console.log('\n───────────────────────────────────────────────\n');
-}
-
-// ── Filter MCP metric payloads to WATCHED_METRICS ────────────────────────────
-// Handles shapes: { metrics: [...] }  { subscriptions: [...] }  top-level array
-// Returns the original string unchanged if shape is unrecognised or
-// WATCHED_METRICS is empty.
-const METRICS_TOOL_NAMES = new Set([
-  'list_metrics', 'get_pulse_metrics', 'list_pulse_metrics',
-  'get_metrics',  'pulse_list_metrics', 'tableau_pulse_list_metrics',
-  'list_subscribed_metrics', 'get_subscriptions',
-]);
-
-function filterMetricPayload(rawText, watchlist) {
-  if (!watchlist || watchlist.length === 0) return rawText;
-
-  let parsed;
-  try { parsed = JSON.parse(rawText); }
-  catch { return rawText; }
-
-  // All entries in WATCHED_METRICS are UUIDs, so we only need UUID matching
-  const uuids = new Set(watchlist.map(w => w.toLowerCase()));
-
-  const matches = item => {
-    const id = (
-      item.id         ||
-      item.metric_id  ||
-      item.metric?.id ||
-      ''
-    ).toLowerCase();
-    return uuids.has(id);
-  };
-
-  // Shape A: top-level array
-  if (Array.isArray(parsed)) {
-    const kept = parsed.filter(matches);
-    console.log(`  filter: ${parsed.length} → ${kept.length} metrics (array shape)`);
-    return JSON.stringify(kept, null, 2);
-  }
-
-  // Shape B: keyed object  { metrics: [...] | subscriptions: [...] | data: [...] }
-  const result = { ...parsed };
-  for (const key of ['metrics', 'subscriptions', 'data']) {
-    if (Array.isArray(parsed[key])) {
-      const kept = parsed[key].filter(matches);
-      console.log(`  filter: ${parsed[key].length} → ${kept.length} metrics ("${key}" shape)`);
-      result[key] = kept;
-    }
-  }
-
-  return JSON.stringify(result, null, 2);
-}
-
 // ── /watched-metrics ──────────────────────────────────────────────────────────
 app.get('/watched-metrics', (req, res) => res.json({ metricIds: WATCHED_METRICS }));
 
@@ -491,6 +316,8 @@ app.all('/tableau-proxy/*path', async (req, res) => {
 
     console.log(`Proxy response: HTTP ${upstream.status} — ${body.length} chars`);
 
+    if (upstream.status === 401) tableauSession = null;
+
     res
       .status(upstream.status)
       .type(upstream.headers.get('content-type') || 'application/json')
@@ -512,12 +339,11 @@ app.all('/tableau-proxy/*path', async (req, res) => {
   }
 });
 
-// ── /debug-safety-fields (temp) ──────────────────────────────────────────────
+// ── /debug-safety-fields ──────────────────────────────────────────────────────
 app.get('/debug-safety-fields', async (req, res) => {
   try {
-    const result = await callMCPTool('get-datasource-metadata', { datasourceLuid: SAFETY_DATASOURCE_LUID });
-    const text = result.map(c => c.text || JSON.stringify(c)).join('\n');
-    res.type('text').send(text);
+    const meta = await vizqlReadMetadata(SAFETY_DATASOURCE_LUID);
+    res.json(meta);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -526,13 +352,6 @@ app.get('/debug-safety-fields', async (req, res) => {
 // ── /debug-auth ───────────────────────────────────────────────────────────────
 app.get('/debug-auth', async (req, res) => {
   const out = {};
-
-  try {
-    const tools    = await getMCPTools();
-    out.mcpTools   = tools.map(t => ({ name: t.name, description: t.description?.substring(0, 80) }));
-  } catch (e) {
-    out.mcpTools = { error: e.message };
-  }
 
   try {
     const r        = await fetch(`${TABLEAU_SERVER}/api/${TABLEAU_API}/serverinfo`,
@@ -590,18 +409,6 @@ app.get('/debug-auth', async (req, res) => {
 
 // ── /pulse-metrics ────────────────────────────────────────────────────────────
 app.get('/pulse-metrics', async (req, res) => {
-  console.log('\n═══ /pulse-metrics: trying MCP first ═══');
-  try {
-    const mcpResult = await getPulseMetricsViaMCP();
-    if (mcpResult) {
-      console.log(`✔ Returning MCP data from ${mcpResult.source}`);
-      return res.json({ source: mcpResult.source, raw: mcpResult.data });
-    }
-    console.log('No matching MCP tool found — falling back to direct API');
-  } catch (e) {
-    console.warn('MCP path failed:', e.message, '— falling back to direct API');
-  }
-
   let session;
   try {
     session = await getTableauSession();
@@ -616,141 +423,14 @@ app.get('/pulse-metrics', async (req, res) => {
   }
 
   return res.status(502).json({
-    error: 'All Pulse data strategies failed.',
+    error: 'Pulse data fetch failed.',
     hint: [
       '1. Check /debug-auth — look for the first 2xx status.',
       '2. Confirm your user has metrics subscribed in Tableau Pulse.',
-      '3. Confirm the Connected App has tableau:metrics_subscriptions:read scope.',
-      '4. If /debug-auth shows no matching MCP tools, the MCP server may need configuration.'
+      '3. Confirm the Connected App has tableau:metrics_subscriptions:read scope.'
     ],
     debug: '/debug-auth'
   });
-});
-
-// ── /mcp-tools ────────────────────────────────────────────────────────────────
-app.get('/mcp-tools', async (req, res) => {
-  try {
-    const tools = await getMCPTools();
-    res.json({ count: tools.length, tools: tools.map(t => ({ name: t.name, description: t.description })) });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── /ask  (agentic loop) ──────────────────────────────────────────────────────
-app.post('/ask', async (req, res) => {
-  const { prompt } = req.body;
-  try {
-    const mcpTools       = await getMCPTools();
-    const anthropicTools = mcpTools.map(t => ({
-      name:         t.name,
-      description:  t.description,
-      input_schema: t.inputSchema || { type: 'object', properties: {} }
-    }));
-
-    const messages = [{
-      role:    'user',
-      content: prompt
-    }];
-
-    let rawAnswer       = '<p>No response generated.</p>';
-    let iterations      = 0;
-    const maxIterations = 10;
-
-    while (iterations < maxIterations) {
-      iterations++;
-      console.log(`\n── Agentic loop iteration ${iterations} ──`);
-
-      const response = await anthropic.messages.create({
-        model:      'us.anthropic.claude-opus-4-5-20251101-v1:0',
-        max_tokens: 8192,
-        system:     COO_SYSTEM_PROMPT,
-        tools:      anthropicTools,
-        messages
-      });
-
-      console.log(`Stop reason: ${response.stop_reason}`);
-
-      if (response.stop_reason === 'end_turn') {
-        const tb = response.content.find(b => b.type === 'text');
-        if (tb) rawAnswer = tb.text;
-        break;
-      }
-
-      if (response.stop_reason === 'tool_use') {
-        messages.push({ role: 'assistant', content: response.content });
-        const toolResults = [];
-
-        for (const block of response.content) {
-          if (block.type !== 'tool_use') continue;
-          console.log(`Claude requested tool: ${block.name}`, block.input);
-
-          try {
-            const mcpResult = await callMCPTool(block.name, block.input);
-            let resultText  = mcpResult.map(c => c.text || JSON.stringify(c)).join('\n');
-
-            // ── Apply metric allowlist filter for listing tools ────────────
-            if (METRICS_TOOL_NAMES.has(block.name)) {
-              const before = resultText.length;
-              resultText   = filterMetricPayload(resultText, WATCHED_METRICS);
-              console.log(`  Metric filter: ${before} → ${resultText.length} chars`);
-            }
-
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: resultText });
-          } catch (err) {
-            toolResults.push({
-              type: 'tool_result', tool_use_id: block.id,
-              content: `Error: ${err.message}`, is_error: true
-            });
-          }
-        }
-
-        messages.push({ role: 'user', content: toolResults });
-
-      } else if (response.stop_reason === 'max_tokens') {
-        const tb = response.content.find(b => b.type === 'text');
-        if (tb) rawAnswer = tb.text;
-        break;
-      } else {
-        break;
-      }
-    }
-
-    // ── Post-process the answer ───────────────────────────────────────────────
-    const stripped    = stripCodeFences(rawAnswer);
-    const finalAnswer = markdownToHtml(stripped);
-
-    const hadFences   = stripped !== rawAnswer;
-    const hadMarkdown = finalAnswer !== stripped;
-    console.log(`\n── Response post-processing:`);
-    console.log(`   Code fences stripped : ${hadFences}`);
-    console.log(`   Markdown converted   : ${hadMarkdown}`);
-    console.log(`   Final length         : ${finalAnswer.length} chars`);
-    console.log(`   Snippet              : ${finalAnswer.substring(0, 200)}`);
-
-    // ── Parse metrics and build metricIds ─────────────────────────────────────
-    const identifiedMetrics = parseMetricsFromHTML(finalAnswer);
-    logIdentifiedMetrics(identifiedMetrics);
-
-    const metricIds = identifiedMetrics
-      .filter(m => m.id)
-      .map(m => ({ id: m.id, name: m.name || 'Unnamed Metric' }));
-
-    console.log(`\n── /ask returning ${metricIds.length} metricId(s) to frontend:`);
-    metricIds.forEach(m => console.log(`   • "${m.name}"  →  ${m.id}`));
-
-    res.json({
-      answer:             finalAnswer,
-      rawAnswer,
-      identifiedMetrics,
-      metricIds,
-      toolCallCount:      iterations
-    });
-
-  } catch (err) {
-    console.error('Error in /ask:', err.message);
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // ── /tableau/auth — connection check for the Pulse Bundle Tester ─────────────
@@ -985,7 +665,41 @@ async function callPulseSpringboardFiltered(session, metricId, marketArea, allow
   return springboardRes.json();
 }
 
+// ── Pulse insight helpers — extract structured data without an LLM ────────────
+function pickTopBreakdownDimension(briefBody, dimensionKeyword) {
+  const lower = dimensionKeyword.toLowerCase();
+  const insights = (briefBody.source_insights || []).filter(ins => {
+    const q = (ins.question || ins.markup || '').toLowerCase();
+    return q.includes(lower);
+  });
+
+  for (const ins of insights) {
+    const facts = ins.facts?.target_period_value?.dimensions
+              || ins.result?.facts?.target_period_value?.dimensions
+              || [];
+    if (Array.isArray(facts) && facts.length) {
+      const top = [...facts].sort((a, b) => (b.value || 0) - (a.value || 0))[0];
+      const name = top?.values?.[0]?.string_value || top?.value_name || top?.name;
+      if (name) return name;
+    }
+
+    const markup = ins.markup || ins.result?.markup || '';
+    const m = markup.match(new RegExp(`<strong>([^<]+)</strong>[^<]*${dimensionKeyword}`, 'i'))
+          || markup.match(new RegExp(`${dimensionKeyword}[^<]*<strong>([^<]+)</strong>`, 'i'));
+    if (m) return m[1].trim();
+  }
+  return null;
+}
+
+function joinPulseMarkup(briefBody, filterFn) {
+  const insights = (briefBody.source_insights || []).filter(filterFn || (() => true));
+  return insights.map(i => i.markup || i.result?.markup || '').filter(Boolean).join('\n\n');
+}
+
 // ── /safety-pulse-summary ─────────────────────────────────────────────────────
+// Renders Tableau Pulse insights directly. Pulse already produces an AI-written
+// narrative server-side; this route extracts the headline + top market area
+// without a second LLM round-trip.
 app.get('/safety-pulse-summary', async (req, res) => {
   try {
     const session = await getTableauSession();
@@ -993,61 +707,30 @@ app.get('/safety-pulse-summary', async (req, res) => {
     const briefBody = await callPulseBriefDirect(
       session,
       [SAFETY_METRIC_ID],
-      'What are the key trends and changes for this safety metric? Which Market Areas are contributing the most to the incident count? Focus on concerning trends, significant changes from the prior period, and the top contributing Market Areas.'
+      'What are the key trends and changes for this safety metric? Which Market Areas are contributing the most to the incident count?'
     );
 
-    // Extract the top-level narrative
-    let insightsText = '';
-    if (briefBody.markup) {
-      insightsText = briefBody.markup;
-    } else if (briefBody.brief?.summary) {
-      insightsText = briefBody.brief.summary;
-    } else if (briefBody.messages?.[0]?.content) {
-      insightsText = briefBody.messages[0].content;
-    } else {
-      insightsText = JSON.stringify(briefBody, null, 2);
-    }
+    const headlineMarkup =
+        briefBody.markup
+     || briefBody.brief?.summary
+     || briefBody.messages?.[0]?.content
+     || joinPulseMarkup(briefBody, ins => !(ins.question || '').toLowerCase().includes('market area'))
+     || '';
 
-    // Separate Market Area breakdown insights from general insights
-    const sourceInsights = briefBody.source_insights || [];
-    const marketAreaInsights = sourceInsights.filter(ins =>
+    const marketAreaMarkup = joinPulseMarkup(briefBody, ins =>
       (ins.question || ins.markup || '').toLowerCase().includes('market area')
     );
-    const otherInsights = sourceInsights.filter(ins => !marketAreaInsights.includes(ins));
 
-    const formatInsight = ins => ins.markup || ins.question || '';
+    const topMarketArea = pickTopBreakdownDimension(briefBody, 'market area');
 
-    const marketAreaContext = marketAreaInsights.map(formatInsight).filter(Boolean).join('\n\n');
-    const generalContext    = otherInsights.map(formatInsight).filter(Boolean).join('\n\n');
+    const headlineHtml = markdownToHtml(headlineMarkup);
+    const marketAreaHtml = topMarketArea
+      ? `<p><strong>Top Market Area:</strong> ${topMarketArea}</p>`
+      : `<p><strong>Top Market Area:</strong> Not available.</p>`;
 
-    const fullContext = [
-      insightsText,
-      marketAreaContext ? `\n\n=== MARKET AREA BREAKDOWN INSIGHTS ===\n${marketAreaContext}` : '',
-      generalContext    ? `\n\n=== OTHER INSIGHTS ===\n${generalContext}` : ''
-    ].join('');
-
-    const response = await anthropic.messages.create({
-      model: 'us.anthropic.claude-opus-4-5-20251101-v1:0',
-      max_tokens: 1024,
-      system: `You are a safety analyst for Hertz. You receive raw Tableau Pulse insight data for a safety metric.
-Output valid HTML only. Allowed tags: <p> <strong> <em>. No markdown, no code fences, no headings, no lists, no other tags.
-Structure your response as EXACTLY three items, nothing else:
-1. One <p> containing the single most important takeaway about the overall safety metric — one or two sentences max, with a specific number.
-2. One <p> starting with <strong>Top Market Area:</strong> followed by the name of the single highest-risk Market Area and its specific incident count or change. If no Market Area data is present, write <strong>Top Market Area:</strong> Not available.
-3. One machine-readable tag on its own line: <market-area>EXACT MARKET AREA NAME HERE</market-area> — put the exact market area name from the data, or "unknown" if not available. This tag will be stripped from the display.`,
-      messages: [{
-        role: 'user',
-        content: `Extract the key takeaway and top Market Area from these Tableau Pulse insights for a Hertz safety incident count metric. The MARKET AREA BREAKDOWN INSIGHTS section (if present) contains the dimensional data:\n\n${fullContext}`
-      }]
-    });
-
-    const raw_text = response.content.find(b => b.type === 'text')?.text || '';
-    const cleaned  = stripCodeFences(raw_text);
-
-    // Extract the machine-readable market area tag
-    const maMatch      = cleaned.match(/<market-area>(.*?)<\/market-area>/i);
-    const topMarketArea = maMatch ? maMatch[1].trim() : null;
-    const summary      = cleaned.replace(/<market-area>.*?<\/market-area>/i, '').trim();
+    const summary = `${headlineHtml}\n${marketAreaHtml}${
+      marketAreaMarkup ? `\n<details><summary>Market Area details</summary>${markdownToHtml(marketAreaMarkup)}</details>` : ''
+    }`;
 
     // Fetch filtered Pulse insights for the top market area
     let filteredSummary = null;
@@ -1114,51 +797,30 @@ Structure your response as EXACTLY three items, nothing else:
             }
           };
 
-          const banRes = await callMCPTool('generate-pulse-metric-value-insight-bundle', {
-            bundleRequest: banPayload,
-            bundleType:    'detail'
-          });
-          const banText = banRes.map(c => c.text || JSON.stringify(c)).join('\n');
-
-          let banParsed;
-          try { banParsed = JSON.parse(banText); } catch { banParsed = null; }
-          if (banParsed) {
-            const banBundle   = banParsed.bundle_response?.result || banParsed;
-            const banGroups   = banBundle.insight_groups || [];
-            const sourceGroup = banGroups.find(g => g.type === 'breakdown');
-            rootCauseText     = (sourceGroup?.insights || [])
-              .map(i => i.result?.markup || i.markup || '').filter(Boolean).join('\n\n');
-          }
+          const banParsed = await pulseInsightBundle(banPayload, 'detail');
+          const banBundle   = banParsed.bundle_response?.result || banParsed;
+          const banGroups   = banBundle.insight_groups || [];
+          const sourceGroup = banGroups.find(g => g.type === 'breakdown');
+          rootCauseText     = (sourceGroup?.insights || [])
+            .map(i => i.result?.markup || i.markup || '').filter(Boolean).join('\n\n');
         } catch (e) {
           console.warn('BAN bundle root cause failed:', e.message);
         }
 
-        const fullFilteredContext = [
-          springboardText,
-          rootCauseText ? `\n\n=== ROOT CAUSE BREAKDOWN ===\n${rootCauseText}` : ''
-        ].join('');
+        let topRootCause = null;
+        const rcMatch = rootCauseText.match(/<strong>([^<]+)<\/strong>/i)
+                     || rootCauseText.match(/^([^\n,—\-:]+?)(?:\s+(?:accounts|contributes|drives|is|with|—|-))/im);
+        if (rcMatch) topRootCause = rcMatch[1].trim();
 
-        const filteredResponse = await anthropic.messages.create({
-          model:      'us.anthropic.claude-opus-4-5-20251101-v1:0',
-          max_tokens: 300,
-          system:     `You are a safety analyst for Hertz. You receive Tableau Pulse insight data filtered to a single market area.
-Output valid HTML only. Allowed tags: <p> <strong> <em>. No markdown, no code fences, no other tags.
-Structure your response as EXACTLY three items, nothing else:
-1. One <p> — one sentence capturing the single most important metric or trend for this market area, with a specific number.
-2. One <p> starting with <strong>Top Root Cause:</strong> followed by the name of the highest-contributing root cause and its specific incident count or share. Use data from the ROOT CAUSE BREAKDOWN section if present. If no root cause data is available, write <strong>Top Root Cause:</strong> Not available.
-3. One machine-readable tag on its own line: <top-root-cause>EXACT ROOT CAUSE NAME HERE</top-root-cause> — the exact root cause value from the data, or "unknown" if not available. This tag will be stripped from the display.`,
-          messages: [{
-            role:    'user',
-            content: `Extract the key insight and top root cause for the "${topMarketArea}" market area:\n\n${fullFilteredContext}`
-          }]
-        });
+        const filteredHtml = [
+          markdownToHtml(springboardText),
+          topRootCause
+            ? `<p><strong>Top Root Cause:</strong> ${topRootCause}</p>`
+            : `<p><strong>Top Root Cause:</strong> Not available.</p>`,
+          rootCauseText ? `<details><summary>Root cause details</summary>${markdownToHtml(rootCauseText)}</details>` : ''
+        ].filter(Boolean).join('\n');
 
-        const raw_filtered = stripCodeFences(filteredResponse.content.find(b => b.type === 'text')?.text || '');
-        const rcTagMatch   = raw_filtered.match(/<top-root-cause>(.*?)<\/top-root-cause>/i);
-        filteredSummary    = {
-          html:         raw_filtered.replace(/<top-root-cause>.*?<\/top-root-cause>/i, '').trim(),
-          topRootCause: rcTagMatch ? rcTagMatch[1].trim() : null
-        };
+        filteredSummary = { html: filteredHtml, topRootCause };
       } catch (e) {
         console.warn('Filtered springboard failed:', e.message);
         filteredSummary = { html: `<p><em>Could not load filtered insights: ${e.message}</em></p>`, topRootCause: null };
@@ -1174,53 +836,90 @@ Structure your response as EXACTLY three items, nothing else:
 
 const SAFETY_DATASOURCE_LUID = process.env.SAFETY_DATASOURCE_LUID;
 
-// ── /safety-incidents — fetch from Tableau SafetyData datasource via MCP ─────
+// ── /safety-incidents — VizQL Data Service ───────────────────────────────────
 app.get('/safety-incidents', async (req, res) => {
   try {
-    const result = await callMCPTool('query-datasource', {
-      datasourceLuid: SAFETY_DATASOURCE_LUID,
-      query: {
-        fields: [
-          { fieldCaption: 'Incident number' },
-          { fieldCaption: 'Division' },
-          { fieldCaption: 'Zone' },
-          { fieldCaption: 'Market Area' },
-          { fieldCaption: 'Location Name' },
-          { fieldCaption: 'Facility Type' },
-          { fieldCaption: 'Description Of Location' },
-          { fieldCaption: 'Date of incident' },
-          { fieldCaption: 'Time Of Incident' },
-          { fieldCaption: 'Involved Employee Id' },
-          { fieldCaption: 'Involved Employee Title' },
-          { fieldCaption: 'Incident Type' },
-          { fieldCaption: 'Was A Motor Vehicle Involved' },
-          { fieldCaption: 'Date Reported' },
-          { fieldCaption: 'How Did The Injury Occur' },
-          { fieldCaption: 'What Was The Injury Or Illness' },
-          { fieldCaption: 'Description Of Incident' },
-          { fieldCaption: 'Root Cause' },
-          { fieldCaption: 'Initial Root Cause' },
-          { fieldCaption: 'Why_Did_This_Occur__Why' },
-          { fieldCaption: 'Why_Did_This_Occur__Why1' }
-        ]
-      }
+    const rows = await vizqlQueryDatasource(SAFETY_DATASOURCE_LUID, {
+      fields: [
+        { fieldCaption: 'Incident number' },
+        { fieldCaption: 'Division' },
+        { fieldCaption: 'Zone' },
+        { fieldCaption: 'Market Area' },
+        { fieldCaption: 'Location Name' },
+        { fieldCaption: 'Facility Type' },
+        { fieldCaption: 'Description Of Location' },
+        { fieldCaption: 'Date of incident' },
+        { fieldCaption: 'Time Of Incident' },
+        { fieldCaption: 'Involved Employee Id' },
+        { fieldCaption: 'Involved Employee Title' },
+        { fieldCaption: 'Incident Type' },
+        { fieldCaption: 'Was A Motor Vehicle Involved' },
+        { fieldCaption: 'Date Reported' },
+        { fieldCaption: 'How Did The Injury Occur' },
+        { fieldCaption: 'What Was The Injury Or Illness' },
+        { fieldCaption: 'Description Of Incident' },
+        { fieldCaption: 'Root Cause' },
+        { fieldCaption: 'Initial Root Cause' },
+        { fieldCaption: 'Why_Did_This_Occur__Why' },
+        { fieldCaption: 'Why_Did_This_Occur__Why1' }
+      ]
     });
-    const text = result.map(c => c.text || JSON.stringify(c)).join('\n');
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error(`Tableau MCP query failed: ${text.substring(0, 300)}`);
-    }
-    if (parsed.error || parsed.isError) throw new Error(parsed.error || parsed.message || JSON.stringify(parsed));
-    console.log('SafetyData MCP response shape:', JSON.stringify(parsed).substring(0, 500));
-    const rows = parsed.data ?? parsed.rows ?? parsed.results ?? parsed;
     const records = Array.isArray(rows) ? rows.filter(r => r['Incident number']) : [];
     res.json(records);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── Theme extraction (no-LLM substitute for narrative root-cause analysis) ───
+const THEME_STOPWORDS = new Set([
+  'the','and','for','with','from','that','this','was','were','have','has','had',
+  'not','but','out','its','his','her','they','them','their','about','into','onto',
+  'over','than','then','what','when','where','which','while','will','would','could',
+  'should','been','being','also','only','very','some','more','most','other','because',
+  'while','because','during','due','any','all','one','two','three','off','him','she',
+  'employee','incident','customer','vehicle','car','area','location','time','day','date'
+]);
+
+function extractTokens(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !THEME_STOPWORDS.has(w));
+}
+
+function topThemes(records, fields, n = 5) {
+  const freq = new Map();
+  for (const r of records) {
+    const text = fields.map(f => r[f] || '').join(' ');
+    const seen = new Set();
+    for (const tok of extractTokens(text)) {
+      if (seen.has(tok)) continue;
+      seen.add(tok);
+      freq.set(tok, (freq.get(tok) || 0) + 1);
+    }
+  }
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([term, count]) => ({ term, count }));
+}
+
+function buildRcaHtml({ heading, periodLabel, marketArea, totalIncidents, themes, topMarketAreaSummary }) {
+  const themeList = themes.length
+    ? `<ul>${themes.map(t => `<li><strong>${t.term}</strong> — appears in ${t.count} incident${t.count === 1 ? '' : 's'}</li>`).join('')}</ul>`
+    : '<p><em>Not enough text in root-cause fields to identify themes.</em></p>';
+
+  return [
+    topMarketAreaSummary || '',
+    `<h3>${heading}</h3>`,
+    `<p>Analyzed <strong>${totalIncidents}</strong> incidents${marketArea ? ` in <strong>${marketArea}</strong>` : ''} for ${periodLabel}.</p>`,
+    `<h3>Recurring Themes in Root-Cause Text</h3>`,
+    themeList,
+    `<p><em>Themes are surfaced by frequency analysis of the Initial Root Cause and Why fields. Review the underlying incidents in Tableau for full context.</em></p>`
+  ].filter(Boolean).join('\n');
+}
 
 function parseCSVLine(line) {
   const result = [];
@@ -1250,55 +949,40 @@ app.get('/safety-rca', async (req, res) => {
     const quarter    = Math.ceil((now.getMonth() + 1) / 3);
     const periodLabel = `Q${quarter} ${now.getFullYear()}`;
 
-    const result = await callMCPTool('query-datasource', {
-      datasourceLuid: SAFETY_DATASOURCE_LUID,
-      query: {
-        fields: [
-          { fieldCaption: 'Incident number' },
-          { fieldCaption: 'Initial Root Cause' },
-          { fieldCaption: 'Why_Did_This_Occur__Why' },
-          { fieldCaption: 'Why_Did_This_Occur__Why1' }
-        ],
-        filters: [
-          {
-            field: { fieldCaption: 'Market Area' },
-            filterType: 'SET',
-            values: [marketArea],
-            exclude: false
-          },
-          ...(rootCause ? [{
-            field: { fieldCaption: 'Root Cause' },
-            filterType: 'SET',
-            values: [rootCause],
-            exclude: false
-          }] : []),
-          {
-            field: { fieldCaption: 'New Date' },
-            filterType: 'DATE',
-            periodType: 'QUARTERS',
-            dateRangeType: 'CURRENT'
-          }
-        ]
-      }
+    const rows = await vizqlQueryDatasource(SAFETY_DATASOURCE_LUID, {
+      fields: [
+        { fieldCaption: 'Incident number' },
+        { fieldCaption: 'Initial Root Cause' },
+        { fieldCaption: 'Why_Did_This_Occur__Why' },
+        { fieldCaption: 'Why_Did_This_Occur__Why1' }
+      ],
+      filters: [
+        {
+          field: { fieldCaption: 'Market Area' },
+          filterType: 'SET',
+          values: [marketArea],
+          exclude: false
+        },
+        ...(rootCause ? [{
+          field: { fieldCaption: 'Root Cause' },
+          filterType: 'SET',
+          values: [rootCause],
+          exclude: false
+        }] : []),
+        {
+          field: { fieldCaption: 'New Date' },
+          filterType: 'DATE',
+          periodType: 'QUARTERS',
+          dateRangeType: 'CURRENT'
+        }
+      ]
     });
-
-    const text = result.map(c => c.text || JSON.stringify(c)).join('\n');
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error(`Tableau MCP query failed: ${text.substring(0, 300)}`);
-    }
-    if (parsed.error || parsed.isError) throw new Error(parsed.error || parsed.message || JSON.stringify(parsed));
-    console.log('SafetyData RCA MCP response shape:', JSON.stringify(parsed).substring(0, 500));
-    const rows = parsed.data ?? parsed.rows ?? parsed.results ?? parsed;
     const records = Array.isArray(rows) ? rows.filter(r => r['Incident number']) : [];
 
     if (!records.length) {
       return res.status(404).json({ error: `No incidents found for "${marketArea}" in ${periodLabel}` });
     }
 
-    // Extract the three root cause text fields
     const rcaEntries = records
       .map(r => ({
         incident: r['Incident number'],
@@ -1308,36 +992,22 @@ app.get('/safety-rca', async (req, res) => {
       }))
       .filter(r => r.initial || r.why || r.why1);
 
-    const incidentText = rcaEntries.map(r =>
-      `Incident ${r.incident}:\n` +
-      (r.initial ? `  Initial Root Cause: ${r.initial}\n` : '') +
-      (r.why     ? `  Why It Occurred: ${r.why}\n`        : '') +
-      (r.why1    ? `  Further Why: ${r.why1}\n`           : '')
-    ).join('\n');
-
-    const response = await anthropic.messages.create({
-      model:      'us.anthropic.claude-opus-4-5-20251101-v1:0',
-      max_tokens: 1024,
-      system:     `You are a workplace safety analyst for Hertz. You analyze root cause text from safety incidents to identify systemic investigation priorities.
-Output valid HTML only. Allowed tags: <h3> <ul> <li> <p> <strong> <em>. No markdown, no code fences, no other tags.
-Be concise. Structure your response as:
-1. <h3>Key Investigation Areas</h3> — a <ul> of 3–5 <li> items, each naming a recurring theme found across the root cause fields with the approximate number of incidents mentioning it.
-2. <h3>Recommended Focus</h3> — a single <p> of 2–3 sentences identifying the single highest-priority systemic issue and what action should be taken first.`,
-      messages: [{
-        role:    'user',
-        content: `These are root cause fields (INITIAL_ROOT_CAUSE, WHY_DID_THIS_OCCUR__WHY, WHY_DID_THIS_OCCUR__WHY1) from ${rcaEntries.length} safety incidents in the "${marketArea}" market area${rootCause ? ` filtered to root cause "${rootCause}"` : ''}. Identify the key areas of investigation:\n\n${incidentText}`
-      }]
+    const themes = topThemes(rcaEntries, ['initial', 'why', 'why1'], 5);
+    const analysis = buildRcaHtml({
+      heading:        `Key Investigation Areas — ${marketArea}${rootCause ? ` / ${rootCause}` : ''}`,
+      periodLabel,
+      marketArea,
+      totalIncidents: records.length,
+      themes
     });
 
-    const llmText = response.content.find(b => b.type === 'text')?.text || '';
     res.json({
-      analysis:        stripCodeFences(llmText),
+      analysis,
       marketArea,
       rootCause:       rootCause || null,
       periodLabel,
       totalIncidents:  records.length,
-      recordsAnalyzed: rcaEntries.length,
-      usage:           response.usage
+      recordsAnalyzed: rcaEntries.length
     });
   } catch (e) {
     console.error('/safety-rca error:', e.message);
@@ -1352,72 +1022,64 @@ app.get('/safety-full-rca', async (req, res) => {
     const quarter     = Math.ceil((now.getMonth() + 1) / 3);
     const periodLabel = `Q${quarter} ${now.getFullYear()}`;
 
-    const result = await callMCPTool('query-datasource', {
-      datasourceLuid: SAFETY_DATASOURCE_LUID,
-      query: {
-        fields: [
-          { fieldCaption: 'Incident number' },
-          { fieldCaption: 'Market Area' },
-          { fieldCaption: 'Initial Root Cause' },
-          { fieldCaption: 'Why_Did_This_Occur__Why' },
-          { fieldCaption: 'Why_Did_This_Occur__Why1' }
-        ],
-        filters: [
-          {
-            field: { fieldCaption: 'New Date' },
-            filterType: 'DATE',
-            periodType: 'QUARTERS',
-            dateRangeType: 'CURRENT'
-          }
-        ]
-      }
+    const rows = await vizqlQueryDatasource(SAFETY_DATASOURCE_LUID, {
+      fields: [
+        { fieldCaption: 'Incident number' },
+        { fieldCaption: 'Market Area' },
+        { fieldCaption: 'Initial Root Cause' },
+        { fieldCaption: 'Why_Did_This_Occur__Why' },
+        { fieldCaption: 'Why_Did_This_Occur__Why1' }
+      ],
+      filters: [
+        {
+          field: { fieldCaption: 'New Date' },
+          filterType: 'DATE',
+          periodType: 'QUARTERS',
+          dateRangeType: 'CURRENT'
+        }
+      ]
     });
-
-    const text = result.map(c => c.text || JSON.stringify(c)).join('\n');
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error(`Tableau MCP query failed: ${text.substring(0, 300)}`);
-    }
-    if (parsed.error || parsed.isError) throw new Error(parsed.error || parsed.message || JSON.stringify(parsed));
-
-    const rows    = parsed.data ?? parsed.rows ?? parsed.results ?? parsed;
     const records = Array.isArray(rows) ? rows.filter(r => r['Incident number']) : [];
 
     if (!records.length) {
       return res.status(404).json({ error: `No incidents found for ${periodLabel}` });
     }
 
-    const incidentText = records.map(r =>
-      `Incident ${r['Incident number']} — Market Area: ${r['Market Area'] || 'Unknown'}\n` +
-      (r['Initial Root Cause']         ? `  Initial Root Cause: ${r['Initial Root Cause']}\n`             : '') +
-      (r['Why_Did_This_Occur__Why']    ? `  Why It Occurred: ${r['Why_Did_This_Occur__Why']}\n`           : '') +
-      (r['Why_Did_This_Occur__Why1']   ? `  Further Why: ${r['Why_Did_This_Occur__Why1']}\n`              : '')
-    ).join('\n');
+    const byArea = new Map();
+    for (const r of records) {
+      const a = r['Market Area'] || 'Unknown';
+      byArea.set(a, (byArea.get(a) || 0) + 1);
+    }
+    const topAreaEntry = [...byArea.entries()].sort((a, b) => b[1] - a[1])[0];
+    const topMarketArea = topAreaEntry?.[0] || 'Unknown';
+    const topAreaCount  = topAreaEntry?.[1] || 0;
 
-    const response = await anthropic.messages.create({
-      model:      'us.anthropic.claude-opus-4-5-20251101-v1:0',
-      max_tokens: 1500,
-      system:     `You are a workplace safety analyst for Hertz. You analyze safety incident data across all market areas to identify systemic risks.
-Output valid HTML only. Allowed tags: <h3> <ul> <li> <p> <strong> <em>. No markdown, no code fences, no other tags.
-Structure your response as:
-1. <h3>Highest-Incident Market Area</h3> — a <p> naming the market area with the most incidents this quarter and its count.
-2. <h3>Top Root Cause</h3> — a <p> naming the single most common root cause across that market area's incidents and how many incidents it accounts for.
-3. <h3>Key Investigation Areas</h3> — a <ul> of 3–5 <li> items identifying recurring root cause themes across that market area's incidents, with approximate incident counts.
-4. <h3>Recommended Focus</h3> — a single <p> of 2–3 sentences identifying the single highest-priority systemic issue and what action should be taken first.`,
-      messages: [{
-        role:    'user',
-        content: `These are ${records.length} safety incidents across all market areas for ${periodLabel}. First identify which market area has the most incidents, then identify the top root cause issue in that market area, then perform a full root cause analysis on those incidents:\n\n${incidentText}`
-      }]
+    const topAreaRecords = records.filter(r => (r['Market Area'] || 'Unknown') === topMarketArea);
+    const themes = topThemes(
+      topAreaRecords.map(r => ({
+        initial: r['Initial Root Cause'],
+        why:     r['Why_Did_This_Occur__Why'],
+        why1:    r['Why_Did_This_Occur__Why1']
+      })),
+      ['initial', 'why', 'why1'],
+      5
+    );
+
+    const analysis = buildRcaHtml({
+      heading:        'Key Investigation Areas',
+      periodLabel,
+      marketArea:     topMarketArea,
+      totalIncidents: topAreaCount,
+      themes,
+      topMarketAreaSummary:
+        `<h3>Highest-Incident Market Area</h3><p><strong>${topMarketArea}</strong> with <strong>${topAreaCount}</strong> incident${topAreaCount === 1 ? '' : 's'} in ${periodLabel} (out of ${records.length} total).</p>`
     });
 
-    const llmText = response.content.find(b => b.type === 'text')?.text || '';
     res.json({
-      analysis:        stripCodeFences(llmText),
+      analysis,
       periodLabel,
       recordsAnalyzed: records.length,
-      usage:           response.usage
+      topMarketArea
     });
   } catch (e) {
     console.error('/safety-full-rca error:', e.message);
@@ -1425,77 +1087,31 @@ Structure your response as:
   }
 });
 
-// ── /analyze-safety — analyze one or many incidents with Claude ───────────────
-app.post('/analyze-safety', async (req, res) => {
-  const { incidents, mode = 'individual' } = req.body;
-  if (!incidents || !incidents.length) {
-    return res.status(400).json({ error: 'No incidents provided' });
-  }
-
-  const formatIncident = inc => `
-Incident: ${inc.Incident_number}
-Date: ${inc.Date_of_incident} | Location: ${inc.location_name} | Area: ${inc.description_of_location}
-Division: ${inc.division} | Facility: ${inc.facility_type}
-Type: ${inc.INCIDENT_TYPE} | Motor Vehicle: ${inc.WAS_A_MOTOR_VEHICLE_INVOLVED}
-Employee Title: ${inc.INVOLVED_EMPLOYEE_TITLE}
-How Injury Occurred: ${inc.HOW_DID_THE_INJURY_OCCUR}
-Injury/Illness: ${inc.WHAT_WAS_THE_INJURY_OR_ILLNESS}
-Description: ${inc.DESCRIPTION_OF_INCIDENT}
-Root Cause: ${inc.ROOT_CAUSE}
-Initial Root Cause: ${inc.INITIAL_ROOT_CAUSE}
-Why It Occurred: ${inc.WHY_DID_THIS_OCCUR__WHY}
-Further Why: ${inc.WHY_DID_THIS_OCCUR__WHY1}`.trim();
-
-  let prompt, systemPrompt;
-
-  if (mode === 'summary') {
-    systemPrompt = `You are a workplace safety analyst for Hertz. Analyze multiple safety incidents and identify patterns, systemic risks, and organization-wide recommendations. Be specific and actionable. Output valid HTML only using these tags: <h3> <h4> <ul> <li> <p> <strong> <em> <hr> <div>. No markdown, no code fences.`;
-    prompt = `Analyze these ${incidents.length} safety incidents as a group. Identify:
-1. The top recurring themes and patterns
-2. Which divisions, zones, or facility types are highest risk
-3. The most common root causes
-4. 5 specific, prioritized organization-wide recommendations to reduce incidents
-
-Incidents:
-${incidents.map(formatIncident).join('\n\n---\n\n')}`;
-  } else {
-    systemPrompt = `You are a workplace safety analyst for Hertz. Analyze this safety incident and provide a structured recommendation. Be specific and actionable. Output valid HTML only using these tags: <h3> <h4> <ul> <li> <p> <strong> <em> <hr> <div>. No markdown, no code fences.`;
-    prompt = `Analyze this safety incident and provide:
-1. A brief assessment of what went wrong and the severity
-2. The true underlying root cause (beyond what is listed)
-3. 3 specific corrective actions to prevent recurrence
-4. Any immediate actions that should be taken
-
-${formatIncident(incidents[0])}`;
-  }
-
-  try {
-    const response = await anthropic.messages.create({
-      model:      'us.anthropic.claude-opus-4-5-20251101-v1:0',
-      max_tokens: 2048,
-      system:     systemPrompt,
-      messages:   [{ role: 'user', content: prompt }]
-    });
-    const text = response.content.find(b => b.type === 'text')?.text || '';
-    res.json({ analysis: stripCodeFences(text) });
-  } catch (e) {
-    console.error('analyze-safety error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.use(express.static(path.join(__dirname)));
 
-const options = {
-  key:  fs.readFileSync('key.pem'),
-  cert: fs.readFileSync('cert.pem')
-};
+// Use HTTPS locally, HTTP in production (Railway provides HTTPS)
+const PORT = process.env.PORT || 5500;
+const useHTTPS = fs.existsSync('key.pem') && fs.existsSync('cert.pem');
 
-https.createServer(options, app).listen(5500, () => {
-  console.log('Running at https://localhost:5500');
-  console.log('Diagnostics:');
-  console.log('  https://localhost:5500/debug-auth     ← probes POST variants');
-  console.log('  https://localhost:5500/mcp-tools      ← lists all MCP tools available');
-  console.log('  https://localhost:5500/session-token  ← REST token for browser use');
-  console.log('  https://localhost:5500/tableau-proxy/ ← CORS-safe Tableau API proxy');
-});
+if (useHTTPS) {
+  const options = {
+    key:  fs.readFileSync('key.pem'),
+    cert: fs.readFileSync('cert.pem')
+  };
+  https.createServer(options, app).listen(PORT, () => {
+    console.log(`Running at https://localhost:${PORT}`);
+    console.log('Diagnostics:');
+    console.log(`  https://localhost:${PORT}/debug-auth     ← probes POST variants`);
+    console.log(`  https://localhost:${PORT}/session-token  ← REST token for browser use`);
+    console.log(`  https://localhost:${PORT}/tableau-proxy/ ← CORS-safe Tableau API proxy`);
+  });
+} else {
+  app.listen(PORT, () => {
+    console.log(`Running at http://localhost:${PORT}`);
+    console.log('(HTTPS certificates not found - using HTTP.)');
+    console.log('Diagnostics:');
+    console.log(`  http://localhost:${PORT}/debug-auth`);
+    console.log(`  http://localhost:${PORT}/session-token`);
+    console.log(`  http://localhost:${PORT}/tableau-proxy/`);
+  });
+}
